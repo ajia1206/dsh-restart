@@ -60,7 +60,7 @@ web 界面**右下角**有一个悬浮的「↻ 重启」按钮，点开是确�
 
 ## 重启日志
 
-默认 `<home>/.dsh/logs/dsh-restart.log`，JSONL，一条一行（文件以 0600 创建，因为 `boot`/`armed` 会记录进程命令行）：
+默认 `<home>/.dsh/logs/dsh-restart.log`，JSONL，一条一行（重启日志以 0600 创建，因为 `boot`/`armed` 会记录进程命令行；注意 **supervisor 的子进程 stdout/stderr 日志 `childLogPath` 不是 0600**，按系统默认权限创建）：
 
 | kind | 含义 |
 |---|---|
@@ -81,7 +81,7 @@ supervisor 路径的**拉起动作不被证据阻断**：只要宿主提交了�
 
 「端口已释放」按 **TCP 连接**判定：连接被拒才算已释放，能连上或超时都算仍在监听——一个一直回 503 的监听者不算「端口已释放」。
 
-**「仍然拉起」的已知代价：重复实例。** supervisor 的两个闸门只能证明"本宿主提交了退出"和"本宿主的旧 pid 已经消失"，**不能证明没有别人已经把它拉起来**（launchd、另一个 supervisor、手工操作都算）。所以这种场合我们仍会再 spawn 一次，结果是短暂出现两个实例；通常第二个会因端口被占而自行退出，并被记录成 `ok:false`（`newPid` 非空）。这是为了「绝不因为端点证据而放弃恢复」而付出的代价，取舍方向是明确的：宁可多拉一次，不可少拉一次。
+**「仍然拉起」的已知代价：重复实例。** supervisor 的两个闸门只能证明"本宿主提交了退出"和"本宿主的旧 pid 已经消失"，**不能证明没有别人已经把它拉起来**（launchd、另一个 supervisor、手工操作都算）。所以这种场合我们仍会再 spawn 一次，结果是可能出现两个实例：**端口被争用时**通常第二个会因绑不上而自行退出并被记成 `ok:false`（`newPid` 非空），但若监听不独占端口，两个都可能继续跑下去。这是为了「绝不因为端点证据而放弃恢复」而付出的代价，取舍方向是明确的：宁可多拉一次，不可少拉一次。
 
 `downtimeMs` 量的是**从写 `exiting` 到新进程写 `boot` 的间隔**，包含优雅退出（会话落盘等）耗时，**不等于** HTTP 不可用时长。
 
@@ -130,14 +130,17 @@ supervisor 路径的**拉起动作不被证据阻断**：只要宿主提交了�
 
 所以第二种默认**不走** launchd，改用 supervisor 兜底（慢一点，但不会把自己关在门外）。只有你明确知道自己的父进程会随子进程退出时，才把 `trustParentJob` 打开；打开后 warning 仍会保留，因为那条链路上 KeepAlive 重启的毕竟是 job 主进程，比自持多两个不确定环节。
 
-KeepAlive 的读法也按这个原则收紧：只在 `launchctl print` 输出的 `properties = { ... }` 块内找 `keepalive` 键，**不对整段输出做关键字匹配**——否则 job label、环境变量值或 endpoint 名里出现 "keepalive" 就会被误判成有人托管。读不到 properties 块时按"无法确认"处理，同样倒向 supervisor。
+KeepAlive 的读法按这个原则收紧：只在 `launchctl print` 输出的 **properties** 里读，且支持它的两种真实渲染——本机（macOS 26）是单行旗标表 `properties = keepalive | runatload | ...`，列表里有 `keepalive` 才算无条件开启；旧式多行 `properties = { keepalive = 1 }` 块也认。**不对整段输出做关键字匹配**——否则 job label、环境变量值或 endpoint 名里出现 "keepalive" 就会被误判成有人托管。条件式策略（`semaphores = { successful exit => 0 }`，或块里的字典值）一律不认；没有 properties 行时按"无法确认"处理，同样倒向 supervisor。
 
 ## 安装（第三方用户）
 
 装进任意 profile，两个来源二选一：
 
     dsh plugin --profile web add github:ajia1206/dsh-restart     # 仓库公开后可用
-    dsh plugin --profile web add @ajia1206/dsh-restart           # npm 包（发布后可用）
+    # 或从 GitHub Release 的 tgz 安装（市场一键安装用的就是这条地址）
+    dsh plugin --profile web add https://github.com/ajia1206/dsh-restart/releases/latest/download/dsh-restart.tgz
+
+> 本包**没有发布到 npm**：`dsh-restart` 这个名字在 npm 上已被他人占用，要发只能用带作用域的 `@ajia1206/dsh-restart`，而那会同时改掉 `package.json` 与 `cordis.patch.yml` 里的包名、并需要重装一次 profile 依赖。目前选择的是 Release tgz 这条更轻的路。
 
 装完**服务端半边当场生效**（新增 bundle 立即挂载，三个工具马上可用）；**右下角的按钮要重启一次才出现**——客户端 bundle 是宿主在启动时快照进启动图的，运行中新增的客户端半边不会被补扫。用 dsh_restart 重启一次即可。
 
@@ -166,7 +169,7 @@ dsh 不在 PATH 上时，用共享层入口（路径随安装位置变化）：
 
 ## 开发
 
-    node --test test/*.test.mjs    # 104 项：进程探测、launchd/KeepAlive 解析、计划决策、日志历史与配对、HTTP 路由与鉴权、客户端 bundle、恢复预检与 supervisor 启动、supervisor 真实拉起、桌面版退出路径
+    node --test test/*.test.mjs    # 107 项：进程探测、launchd/KeepAlive 解析、计划决策、日志历史与配对、HTTP 路由与鉴权、客户端 bundle、恢复预检与 supervisor 启动、supervisor 真实拉起、桌面版退出路径
     node scripts/smoke.mjs <pid>   # 对任意 pid 只读打印探测结果与 Web 重启计划（不提供桌面事实）
 
 lib/proc.js、lib/plan.js、lib/log.js、lib/http.js 不 import 任何 @deepseek-ai/*，也不碰 DSH 运行时，所以单测不需要启动 DSH；只有 index.js 依赖 dsh-tools 与 schemastery。supervisor.mjs 是独立进程，可以单独跑。
@@ -228,7 +231,7 @@ test/client.test.mjs 把 lib/client.js 放进一个假的 window.__ModuleLoader_
 
 | 检查 | 结果 |
 |---|---|
-| 全套单测 | **104/104 通过**（`node --test test/*.test.mjs`，约 15s，含真实拉起 supervisor 的集成测试） |
+| 全套单测 | **107/107 通过**（`node --test test/*.test.mjs`，约 15s，含真实拉起 supervisor 的集成测试） |
 | 实机只读探测 | `node scripts/smoke.mjs <pid>` 对活着的宿主返回 `keepAlive=null`（RunningBoard 提交的桌面 app job 没有 properties 块）并给出"无法确认 KeepAlive"warning，策略判为 supervisor，不误判为 launchd |
 | 实机 HTTP 鉴权 | 真 socket：无 connection 服务时 `127.0.0.1` 的 status/arm 正常 200（本机 web profile 不受影响）；伪造非回环来源的 arm 得 403 且 handler 未执行 |
 | 无 unhandled rejection | 客户端中途断流时进程挂 `unhandledRejection` 监听、退出码 0；handler resolve 出结构化 500 JSON |

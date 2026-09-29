@@ -118,14 +118,15 @@ test('a boot in the same process does not complete a restart', () => {
 })
 
 test('a matching armId with a new pid is still a completed restart', () => {
+  // launchd has no outcome record, so the boot itself is the completion.
   const history = buildHistory([
-    { kind: 'armed', at: 1000, armId: 'A', pid: 10, reason: 'ok', strategy: 'supervisor' },
+    { kind: 'armed', at: 1000, armId: 'A', pid: 10, reason: 'ok', strategy: 'launchd' },
     { kind: 'exiting', at: 2000, armId: 'A', pid: 10 },
     { kind: 'boot', at: 3200, pid: 20, profile: 'web' },
   ])
   assert.equal(history.restarts.length, 1)
   assert.equal(history.restarts[0].restartedFrom.armId, 'A')
-  assert.equal(history.restarts[0].restartedFrom.strategy, 'supervisor')
+  assert.equal(history.restarts[0].restartedFrom.strategy, 'launchd')
   assert.equal(history.restarts[0].downtimeMs, 1200)
 })
 
@@ -235,4 +236,34 @@ test('a foreign-profile boot neither completes the arm nor erases it', () => {
   assert.equal(history.restarts.length, 1)
   assert.equal(history.restarts[0].pid, 20)
   assert.equal(history.restarts[0].restartedFrom.armId, 'A')
+})
+
+test('a supervisor-strategy arm needs the supervisor outcome before it counts', () => {
+  // No supervised record: a same-profile boot from something else must not be
+  // credited as this restart.
+  const withoutOutcome = buildHistory([
+    { kind: 'armed', at: 1000, armId: 'A', pid: 10, profile: 'web', strategy: 'supervisor' },
+    { kind: 'exiting', at: 2000, armId: 'A', pid: 10, profile: 'web' },
+    { kind: 'boot', at: 3000, pid: 11, profile: 'web' },
+  ])
+  assert.deepEqual(withoutOutcome.restarts, [])
+
+  // The same sequence WITH a successful outcome is a real restart.
+  const withOutcome = buildHistory([
+    { kind: 'armed', at: 1000, armId: 'A', pid: 10, profile: 'web', strategy: 'supervisor' },
+    { kind: 'exiting', at: 2000, armId: 'A', pid: 10, profile: 'web' },
+    { kind: 'boot', at: 3000, pid: 11, profile: 'web' },
+    { kind: 'supervised', at: 3500, armId: 'A', ok: true, newPid: 11 },
+  ])
+  assert.equal(withOutcome.restarts.length, 1)
+  assert.equal(withOutcome.restarts[0].pid, 11)
+})
+
+test('a boot dated before the exit is not this restart', () => {
+  const history = buildHistory([
+    { kind: 'armed', at: 1000, armId: 'A', pid: 10, profile: 'web', strategy: 'launchd' },
+    { kind: 'exiting', at: 5000, armId: 'A', pid: 10, profile: 'web' },
+    { kind: 'boot', at: 4000, pid: 11, profile: 'web' },
+  ])
+  assert.deepEqual(history.restarts, [])
 })

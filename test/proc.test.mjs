@@ -271,3 +271,54 @@ test('probeHealth treats 4xx as up and a closed port as down', async () => {
   })
   assert.equal(down.ok, false)
 })
+
+test('parseKeepAlive reads the single-line flag rendering used by current macOS', () => {
+  // Verbatim shapes captured from live `launchctl print` output on macOS 2026-09:
+  // an unconditional policy lists the `keepalive` flag; a conditional one does
+  // not, and shows up as a semaphores block instead.
+  const unconditional = [
+    'gui/501/com.apple.TextInputMenuAgent = {',
+    TAB + 'active count = 1',
+    TAB + 'properties = keepalive | runatload | supports transactions | app | system service | exponential throttling | tle system',
+    TAB + 'pid = 1234',
+    '}',
+  ].join('\n')
+  assert.equal(parseKeepAlive(unconditional), true)
+
+  const anotherUnconditional = [
+    'gui/501/homebrew.mxcl.postgresql@15 = {',
+    TAB + 'properties = keepalive | runatload | inferred program | managed LWCR | has LWCR',
+    '}',
+  ].join('\n')
+  assert.equal(parseKeepAlive(anotherUnconditional), true)
+
+  const noKeepAlive = [
+    'gui/501/com.apple.progressd = {',
+    TAB + 'properties = supports transactions | supports pressured exit | system service | exponential throttling | tle system',
+    '}',
+  ].join('\n')
+  assert.equal(parseKeepAlive(noKeepAlive), false)
+
+  const conditional = [
+    'gui/501/io.tailscale.ipn.macsys.login-item-helper = {',
+    TAB + 'properties = supports transactions | resolve program | has LWCR',
+    TAB + 'semaphores = {',
+    TAB + TAB + 'successful exit => 0',
+    TAB + '}',
+    '}',
+  ].join('\n')
+  // Conditional is not unconditional permission: either answer keeps the
+  // supervisor path, and this one is readable as "no keepalive flag".
+  assert.equal(parseKeepAlive(conditional), false)
+
+  // A label that merely contains the word, with no properties line at all, is
+  // still unknown rather than permission.
+  const labelOnly = [
+    'gui/501/com.example.keepalive-thing = {',
+    TAB + 'inherited environment = {',
+    TAB + TAB + 'KEEPALIVE_HINT => keepalive',
+    TAB + '}',
+    '}',
+  ].join('\n')
+  assert.equal(parseKeepAlive(labelOnly), null)
+})

@@ -42,6 +42,9 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const SUPERVISOR_PATH = join(HERE, 'lib', 'supervisor.mjs')
 const LOG_DIR = join(homedir(), '.dsh', 'logs')
 
+/** How long an accepted graceful exit may take before the arm is released. */
+const EXIT_GRACE_MS = 10000
+
 /** Deployment knobs; none of these are inlined in the tool bodies. */
 export const Config = Schema.object({
   logPath: Schema.string().default(join(LOG_DIR, 'dsh-restart.log'))
@@ -352,6 +355,17 @@ export function apply(ctx, config) {
       const exit = appExitOf(ctx)
       if (exit !== undefined) {
         exit(0)
+        // The launcher is expected to bring this process down. If it returns
+        // without doing so, the arm must not stay pinned forever — otherwise
+        // cancel refuses and every later arm is rejected as a duplicate.
+        await sleep(EXIT_GRACE_MS)
+        if (armed === state) armed = null
+        await appendRecord(logPath, {
+          kind: 'aborted',
+          at: Date.now(),
+          armId,
+          reason: '已请求优雅退出，但进程在 ' + EXIT_GRACE_MS + 'ms 内仍在运行；已释放本次安排，可重新安排或取消',
+        }).catch(() => {})
         return
       }
       process.kill(process.pid, 'SIGTERM')
@@ -440,6 +454,14 @@ export function apply(ctx, config) {
     } catch (error) {
       if (armed === state) armed = null
       notes.push('未安排重启：写入重启记录失败（' + errorMessage(error) + '）。')
+      return planResult(plan, facts, { logPath, armed: false, notes })
+    }
+
+    // Everything above suspended at least once, so the caller may have
+    // cancelled this arm (or a later arm may have taken the slot) while we were
+    // writing. Reporting `armed:true` then would be a lie.
+    if (state.cancelled || armed !== state) {
+      notes.push('未安排重启：等待期间该次安排已被取消或被后续安排取代。')
       return planResult(plan, facts, { logPath, armed: false, notes })
     }
 
