@@ -9,13 +9,13 @@ DSH 对 profile 配置保持热监听：**新增或移除一个 bundle 会当场
 1. **优雅退出**：走 DSH 自己的 ctx.appExit，先 dispose 整棵插件树（会话落盘、HTTP 服务关闭），再让进程自然结束——不是 kill。
 2. **退出前先确认"有人会把它拉起来"**：launchd 有 KeepAlive 就直接退出；没有托管就派一个 detached supervisor 并等它完成握手，握手失败就**取消退出**，服务保持运行。
 
-## 两种策略
+## 三种策略
 
 插件先探测自己是被谁托管的，再决定怎么做：
 
 | 策略 | 触发条件 | 行为 |
 |---|---|---|
-| launchd | 本进程或其祖先出现在 launchctl 的某个 job 里，且该 job 有 KeepAlive | 调 ctx.appExit(0) 优雅退出，launchd 立即拉起 |
+| launchd | 本进程或**直接父进程**出现在 launchctl 的某个 job 里，且该 job 有 KeepAlive | 调 ctx.appExit(0) 优雅退出，launchd 立即拉起 |
 | supervisor | 没有可确认的 KeepAlive 托管（手动 pnpm dsh 启动等） | 派 detached supervisor：等旧 pid 退出 → 等端口释放 → 用同一 execPath/execArgv/argv/cwd/env 拉起 → 健康检查 → 结果写日志 |
 | none | 没有托管且 superviseFallback=false | 拒绝重启，服务保持运行 |
 
@@ -73,8 +73,8 @@ web 界面**右下角**有一个悬浮的「↻ 重启」按钮，点开是确�
     - id: dsh-restart
       name: dsh-restart
       config:
-        logPath: /Users/getui/.dsh/logs/dsh-restart.log
-        childLogPath: /Users/getui/.dsh/logs/dsh-restart-child.log
+        logPath: ~/.dsh/logs/dsh-restart.log
+        childLogPath: ~/.dsh/logs/dsh-restart-child.log
         defaultDelaySeconds: 10
         maxDelaySeconds: 600
         superviseFallback: true
@@ -103,46 +103,38 @@ web 界面**右下角**有一个悬浮的「↻ 重启」按钮，点开是确�
 
 装进任意 profile，两个来源二选一：
 
-    dsh plugin --profile web add github:ajia1206/dsh-restart     # 直接从 GitHub 仓库装
+    dsh plugin --profile web add github:ajia1206/dsh-restart     # 仓库公开后可用
     dsh plugin --profile web add @ajia1206/dsh-restart           # npm 包（发布后可用）
 
-装完**服务端半边当场生效**：profile 配置在热监听范围内，新增 bundle 会立即挂载，三个工具马上可用。
-
-但**右下角的按钮要重启一次才出现**：客户端 bundle 是宿主在启动时快照进启动图的，运行中新增的客户端半边不会被补扫（已实测：加完再查活进程的启动图里没有它）。这也正是 dsh_restart 的用武之地——用工具重启一次，按钮就出来了。
-
-之后**改这个插件自己的源码也需要重启**（源码模块不在热监听范围内）。想先只读确认，可以调 dsh_restart_status，它会报告托管方式、端口和重启历史。
+装完**服务端半边当场生效**（新增 bundle 立即挂载，三个工具马上可用）；**右下角的按钮要重启一次才出现**——客户端 bundle 是宿主在启动时快照进启动图的，运行中新增的客户端半边不会被补扫。用 dsh_restart 重启一次即可。
 
 ## 安装（本机开发）
 
 **必须用 file: 前缀装成 profile 内的真实目录**（裸目录会被 pnpm 装成软链，裸包名解析不到共享层，插件会静默不激活）：
 
-    cd /Users/getui/Documents/ajia1206/02-MyProjects/dsh-插件/dsh-restart
+    cd /path/to/dsh-restart
     dsh plugin --profile web add file:"$PWD"
     dsh --profile web --dump-config | grep -A2 dsh-restart
-
-装完后**服务端半边当场生效**：profile 配置在热监听范围内，新增 bundle 会立即挂载，三个工具马上可用。
-
-但**右下角的按钮要重启一次才出现**：客户端 bundle 是宿主在启动时快照进启动图的，运行中新增的客户端半边不会被补扫（已实测：加完再查活进程的启动图里没有它）。这也正是 dsh_restart 的用武之地——用工具重启一次，按钮就出来了。
 
 之后**改这个插件自己的源码也需要重启**（源码模块不在热监听范围内）。想先只读确认，可以调 dsh_restart_status，它会报告托管方式、端口和重启历史。
 
 如果插件本身装坏了、连工具都起不来，就得手动兜底：
 
-    # launchd 托管时（本机 web profile 就是）
-    launchctl kickstart -k gui/$(id -u)/com.dsh.web-alpha2
+    # launchd 托管时，换成你自己 job 的 label
+    launchctl kickstart -k gui/$(id -u)/<你的 launchd label>
 
 卸载：
 
     dsh plugin --profile web remove dsh-restart
 
-本机 dsh 不在 PATH 上，用共享层入口：
+dsh 不在 PATH 上时，用共享层入口（路径随安装位置变化）：
 
-    node /Users/getui/.dsh/profiles/node_modules/@deepseek-ai/dsh/lib/bin.js
+    node <共享层 node_modules>/@deepseek-ai/dsh/lib/bin.js
 
 ## 开发
 
     node --test test/*.test.mjs    # 52 项：进程探测、计划决策、日志历史、HTTP 路由、客户端 bundle、supervisor 真实拉起、桌面版退出路径
-    node scripts/smoke.mjs 12006   # 对任意 pid 只读打印探测结果与重启计划
+    node scripts/smoke.mjs <pid>   # 对任意 pid 只读打印探测结果与重启计划
 
 lib/proc.js、lib/plan.js、lib/log.js、lib/http.js 不 import 任何 @deepseek-ai/*，也不碰 DSH 运行时，所以单测不需要启动 DSH；只有 index.js 依赖 dsh-tools 与 schemastery。supervisor.mjs 是独立进程，可以单独跑。
 
@@ -171,12 +163,12 @@ test/client.test.mjs 把 lib/client.js 放进一个假的 window.__ModuleLoader_
 | 单测 node --test | 46/46 通过 |
 | supervisor 真实拉起（集成测试） | 杀掉旧进程 → 等端口释放 → 拉起新进程 → 健康检查 ok，新 pid 存活并重新服务端口 |
 | supervisor 失败路径 | 新进程起不来时记录 ok:false 与原因，不谎报成功 |
-| 真实端到端重启（scratch web profile，端口 28099） | 三个工具全部注册；日志依次出现 boot → armed → supervisor 握手 → exiting → supervised ok:true → 新进程 boot；停机 3317ms；原 pid 消失，新 pid 重新服务端口（401） |
-| 重启保留启动上下文 | 重启后的命令行仍是 --profile sr-rst --patch ... --host 127.0.0.1 --port 28099 --no-open |
-| 对活 web 进程的只读探测 | pid 12006 → 父进程 11997 → job com.dsh.web-alpha2，KeepAlive=true，端口 28000，判定 launchd，无告警 |
+| 真实端到端重启（scratch web profile，临时端口） | 三个工具全部注册；日志依次出现 boot → armed → supervisor 握手 → exiting → supervised ok:true → 新进程 boot；停机 3317ms；原 pid 消失，新 pid 重新服务端口（401） |
+| 重启保留启动上下文 | 重启后的命令行仍是 --profile <name> --patch ... --host 127.0.0.1 --port <port> --no-open |
+| 对活 web 进程的只读探测 | pid <pid> → 父进程 <ppid> → job <label>，KeepAlive=true，端口 <port>，判定 launchd，无告警 |
 | 误判回归（重要） | 从 DSH 会话里启动的进程（launchd job 只是远祖）曾被误判成 launchd——那会导致退出后再也起不来；已改为只认本进程或直接父进程，回归测试覆盖 |
-| 在活的 web 进程里调用工具 | dsh_restart dryRun 返回 strategy=launchd、label=com.dsh.web-alpha2、port=28000、restartable=true；dsh_restart_status 返回 uptimeSeconds=23092、portResponds=true |
-| 热挂载行为 | 安装进 web profile 后，正在运行的 pid 12006 当场挂载了本插件并写下 boot 记录（17:16:34），工具立刻可用，无需重启 |
+| 在活的 web 进程里调用工具 | dsh_restart dryRun 返回 strategy=launchd、label=<label>、port=<port>、restartable=true；dsh_restart_status 返回 uptimeSeconds=23092、portResponds=true |
+| 热挂载行为 | 安装进 web profile 后，正在运行的宿主进程当场挂载了本插件并写下 boot 记录，工具立刻可用，无需重启 |
 | 浏览器控件（真实 Chromium 实测） | 右下角渲染出「↻ 重启」；点开后弹窗正确显示托管方式、pid 与运行时长、端口与响应、上次停机时长，延迟选项与原因输入均可用 |
 | 从 GUI 触发的真实重启 | 点「确认重启」→ 弹窗变倒计时 → 日志出现 armed → supervisor 握手 → exiting → supervised ok:true → 新进程 boot（停机 2.0s）→ 端口重新响应（401） |
 | 主题适配回归 | 深色主题下主按钮填充是近白色，文字必须用 --dsw-alias-label-primary-foreground；曾因硬编码 #fff 变成白底白字，已修并有渲染测试覆盖 |
