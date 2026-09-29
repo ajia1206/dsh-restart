@@ -198,3 +198,41 @@ test('readRecords still finds recent records in a log larger than the read windo
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('a supervised record pins the replacement pid and rejects other boots', () => {
+  // The supervisor recorded that IT started pid 12. A boot from pid 11 is not
+  // this restart's replacement, however plausible it looks.
+  const history = buildHistory([
+    { kind: 'armed', at: 1000, armId: 'A', pid: 10, profile: 'web' },
+    { kind: 'exiting', at: 2000, armId: 'A', pid: 10, profile: 'web' },
+    { kind: 'boot', at: 2500, pid: 11, profile: 'web' },
+    { kind: 'supervised', at: 3000, armId: 'A', ok: true, newPid: 12 },
+    { kind: 'boot', at: 3500, pid: 12, profile: 'web' },
+  ])
+  assert.equal(history.restarts.length, 1)
+  assert.equal(history.restarts[0].pid, 12)
+})
+
+test('an exiting record for a different pid does not complete the arm', () => {
+  const history = buildHistory([
+    { kind: 'armed', at: 1000, armId: 'A', pid: 10, profile: 'web' },
+    // Same armId, but this is some other process's exit.
+    { kind: 'exiting', at: 2000, armId: 'A', pid: 77, profile: 'web' },
+    { kind: 'boot', at: 3000, pid: 20, profile: 'web' },
+  ])
+  assert.deepEqual(history.restarts, [])
+})
+
+test('a foreign-profile boot neither completes the arm nor erases it', () => {
+  // Another profile shares this log and boots between our exit and our real
+  // replacement. That must not cost us the real restart.
+  const history = buildHistory([
+    { kind: 'armed', at: 1000, armId: 'A', pid: 10, profile: 'web' },
+    { kind: 'exiting', at: 2000, armId: 'A', pid: 10, profile: 'web' },
+    { kind: 'boot', at: 2500, pid: 30, profile: 'cli' },
+    { kind: 'boot', at: 4000, pid: 20, profile: 'web' },
+  ])
+  assert.equal(history.restarts.length, 1)
+  assert.equal(history.restarts[0].pid, 20)
+  assert.equal(history.restarts[0].restartedFrom.armId, 'A')
+})

@@ -16,11 +16,11 @@ DSH 对 profile 配置保持热监听：**新增或移除一个 bundle 会当场
 | 策略 | 触发条件 | 行为 |
 |---|---|---|
 | desktop | 识别为 macOS 桌面版（有主进程与 IPC 连接） | 通过 macOS 应用退出/重新打开走一遍，等新的 shell 与 Host 重新连上 |
-| launchd | **本进程自己**是某个 launchctl job 的主进程，且该 job 有 KeepAlive | 调 ctx.appExit(0) 优雅退出，launchd 立即拉起 |
+| launchd | **本进程自己**是该 launchctl job 的主进程，且 KeepAlive 是**无条件开启**（条件式策略一律不认） | 调 ctx.appExit(0) 优雅退出，由 launchd 按该 job 的配置拉起 |
 | supervisor | 没有可确认的 KeepAlive 托管（手动启动、或任务主进程只是本进程的父进程） | 派 detached supervisor：等旧 pid 退出 → 确认端口释放 → 用同一 execPath/execArgv/argv/cwd/env 拉起 → 健康检查 + 身份确认 → 结果写日志 |
 | none | 没有托管且 superviseFallback=false | 拒绝重启，服务保持运行 |
 
-supervisor 的握手是关键：它在被杀之前会先往重启日志写一条 supervisor 记录，插件等这条记录出现才允许自己退出；8 秒内没等到就写 aborted 并取消退出。握手只能证明"supervisor 已经起来了"，**不能**证明"新进程一定能起来"——后者发生在旧进程退出之后，只能由 supervisor 记录下来，日志里会如实区分。
+supervisor 的握手是关键：它在被杀之前先写一条 supervisor 记录，再在**恢复资源预检通过后**写一条 supervisor-ready；插件必须等到这两条齐全才允许自己退出，8 秒内没等到就写 aborted 并取消退出。握手只能证明"supervisor 已经起来了"，**不能**证明"新进程一定能起来"——后者发生在旧进程退出之后，只能由 supervisor 记录下来，日志里会如实区分。
 
 desktop 这一行不是凑数：`lib/plan.js` 在探测到桌面事实时**最先**选它，Web 的 launchd/supervisor 判定根本不会走到。
 
@@ -34,7 +34,7 @@ desktop 这一行不是凑数：`lib/plan.js` 在探测到桌面事实时**最�
 
 **dsh_restart_status** — 看托管方式、当前是否已安排重启、以及重启历史。
 
-这是**核验**手段：每次启动都会写一条 boot 记录（带 pid），和之前的 armed/exiting 记录配对后就能算出这次重启的停机时长。
+这是**核验**手段：插件就绪时会写一条 boot 记录（带 pid、profile 与 cwd），和之前的 armed/exiting 记录配对后就能算出这次重启的停机时长。注意 boot 是「插件就绪」的证据而非「进程启动」的证据（热挂载也会写一条），且宿主没有就绪信号时会立即写、写入失败会被静默吞掉——所以「没有 boot」不等于「没启动」。
 
 **dsh_restart_cancel** — 在触发前取消。误触发时用。
 
@@ -52,7 +52,7 @@ web 界面**右下角**有一个悬浮的「↻ 重启」按钮，点开是确�
 | /dsh-restart/arm | POST | 安排重启，body 为 {delaySeconds?, reason?} |
 | /dsh-restart/cancel | POST | 取消已安排的重启 |
 
-鉴权说明（这条别想当然）：注册路由本身**不带鉴权**，所以每条请求都会先交给宿主的 connection 服务判定。宿主没有这个服务时，插件不会直接放行，而是**强制只接受回环来源**（127.0.0.0/8、::1、::ffff:127.x），非回环一律 403；取不到来源地址也按非回环处理。也就是说这三条路由不会因为"反正是本机"而对外网开放——但反过来说，在只有回环的机器上它们确实等同于"本机进程都能调"。
+鉴权说明（这条别想当然）：注册路由本身**不带鉴权**，所以每条请求都会先交给宿主的 connection 服务判定。宿主没有这个服务时，插件不会直接放行，而是**强制只接受回环来源**（127.0.0.0/8、::1、::ffff:127.x），非回环一律 403；取不到来源地址也按非回环处理。也就是说这三条路由不会因为「反正是本机」而对外网开放。两个必须说清的边界：一是在只有回环的机器上，它们等同于「本机进程都能调」；二是如果本机跑着反向代理，**经代理转发过来的外部请求来源地址也是回环**，这种部署下缺了 connection 服务就等于没有鉴权——别把这条回环兜底当成对外防护。
 
 这三条路由和三个工具**共用同一套实现**（index.js 里的 armRestart / cancelRestart / readStatus），不存在两套逻辑。路由只在有 webServer 服务的载体上注册（用 ctx.inject(['webServer'], ...) 可选注入），headless 等载体只有工具，不会卡在等 web 服务。
 
@@ -75,7 +75,13 @@ web 界面**右下角**有一个悬浮的「↻ 重启」按钮，点开是确�
 
 **什么才算一次完成的重启**：`armed` 与 `exiting` 的 armId 相同、随后出现的 `boot` 来自**另一个 pid**、且该 armId 没有失败记录。只靠"armed 后面跟着 boot"是不够的——默认日志被所有 profile 共用，别人的 boot、或者热挂载同一个进程写下的 boot，都不该被算成你这次重启成功。崩溃不会被误报成重启成功。
 
-supervisor 路径判 `ok` 也很严：**必须同时**观测到"旧端点先停止应答"（`portReleased`）**和**"新进程自己写下了 pid 相同的 boot 记录"（`bootMatched`）。少任何一个都报 `ok:false` 并写明原因——宁可误报失败，也不假报成功。代价是：如果某个宿主根本不写 boot 记录，它的 supervisor 兜底会持续报失败（而服务其实活着）。
+supervisor 路径的**拉起动作不被证据阻断**：只要宿主提交了退出、旧进程也真的退出了，它就会用同一份命令行把新进程拉起来——端点探测的结论只决定它**怎么报告**，绝不决定它做不做。
+
+`ok` 的判定则很严：`portReleased`（旧端点在 socket 层不再监听）与 `bootMatched`（新进程自己写下了 **pid 相同**的 boot 记录）都必须为真；没有可探测端点时 `portReleased` 记为 `null`，此时只认 boot 记录。少任何一个都报 `ok:false` 并写明原因——宁可误报失败，也不假报成功。代价是：宿主不写 boot 记录的场合，supervisor 兜底会持续报失败（而服务其实活着）。
+
+「端口已释放」按 **TCP 连接**判定：连接被拒才算已释放，能连上或超时都算仍在监听——一个一直回 503 的监听者不算「端口已释放」。
+
+**「仍然拉起」的已知代价：重复实例。** supervisor 的两个闸门只能证明"本宿主提交了退出"和"本宿主的旧 pid 已经消失"，**不能证明没有别人已经把它拉起来**（launchd、另一个 supervisor、手工操作都算）。所以这种场合我们仍会再 spawn 一次，结果是短暂出现两个实例；通常第二个会因端口被占而自行退出，并被记录成 `ok:false`（`newPid` 非空）。这是为了「绝不因为端点证据而放弃恢复」而付出的代价，取舍方向是明确的：宁可多拉一次，不可少拉一次。
 
 `downtimeMs` 量的是**从写 `exiting` 到新进程写 `boot` 的间隔**，包含优雅退出（会话落盘等）耗时，**不等于** HTTP 不可用时长。
 
@@ -114,7 +120,7 @@ supervisor 路径判 `ok` 也很严：**必须同时**观测到"旧端点先停�
 | exitTimeoutMs | 45000 | supervisor 等旧进程退出的上限；超时不强制终止任何进程，直接如实报失败 |
 | bootHistoryLimit | 5 | 状态里保留的最近重启次数 |
 
-端口是从 DSH 自己的 cmdlineArgs 里读 --port 得来的，不靠猜；读不到才退回 lsof。两者都拿不到且 `healthUrl` 为空时，重启仍然会执行，但"服务是否恢复"无法被证明——结果会如实标注为未确认，不会假报成功。
+端口是从 DSH 自己的 cmdlineArgs 里读 --port 得来的，不靠猜；读不到才退回 lsof。两者都拿不到且 `healthUrl` 为空时，**拉起照常执行**（这条路径上能阻止拉起的只有两件事：旧进程没退出、宿主没提交退出），只是「服务是否恢复」只能由新进程写的 boot 记录来确认，没有端口层面的证据。
 
 ### launchd 与父进程
 
@@ -160,12 +166,12 @@ dsh 不在 PATH 上时，用共享层入口（路径随安装位置变化）：
 
 ## 开发
 
-    node --test test/*.test.mjs    # 94 项：进程探测、launchd/KeepAlive 解析、计划决策、日志历史与配对、HTTP 路由与鉴权、客户端 bundle、恢复预检与 supervisor 启动、supervisor 真实拉起、桌面版退出路径
-    node scripts/smoke.mjs <pid>   # 对任意 pid 只读打印探测结果与重启计划
+    node --test test/*.test.mjs    # 104 项：进程探测、launchd/KeepAlive 解析、计划决策、日志历史与配对、HTTP 路由与鉴权、客户端 bundle、恢复预检与 supervisor 启动、supervisor 真实拉起、桌面版退出路径
+    node scripts/smoke.mjs <pid>   # 对任意 pid 只读打印探测结果与 Web 重启计划（不提供桌面事实）
 
 lib/proc.js、lib/plan.js、lib/log.js、lib/http.js 不 import 任何 @deepseek-ai/*，也不碰 DSH 运行时，所以单测不需要启动 DSH；只有 index.js 依赖 dsh-tools 与 schemastery。supervisor.mjs 是独立进程，可以单独跑。
 
-test/client.test.mjs 把 lib/client.js 放进一个假的 window.__ModuleLoader__ 里求值，用 React 桩渲染组件，因此改坏客户端半边（比如引用未声明的变量、写错座位名、请求非基座模块）会直接测试失败，不必开浏览器才发现。
+test/client.test.mjs 把 lib/client.js 放进一个假的 window.__ModuleLoader__ 里求值，用 React 桩渲染组件，因此客户端半边的不少错误（请求了非基座模块、布防/取消的状态判断写错、渲染出错误文案）会直接测试失败，不必开浏览器才发现。但它不是浏览器：effect 被禁用、事件处理器只被直接调用，所以 effect 内部的错误仍可能逃过这层测试。
 
 改完代码后同步到 profile（pnpm 的 file: 目录依赖是硬链接，编辑器常见的"写临时文件再改名"会断开链接）：
 
@@ -180,7 +186,7 @@ test/client.test.mjs 把 lib/client.js 放进一个假的 window.__ModuleLoader_
 - **不等待"当前回合结束"**。DSH 只暴露了 cmdlineArgs / appExit / appReady 三个启动期服务，没有回合级钩子，所以重启是在固定延迟后触发。延迟内如果模型还在输出，那条消息可能来不及落盘——默认 10 秒就是为这个留的余量，必要时用 delaySeconds 调大。
 - **健康检查把 4xx 当作"已恢复"**：DSH web 在没有 token 时返回 401，这已经说明服务起来了。另外，健康检查只能证明"那个端口上有人应答"，所以判定成功还要加上新进程自己的 boot 记录作为身份确认。
 - **env 不落盘，但 argv 会**。supervisor 拉起用的是当前进程的 env，env 不写进 spec 文件；但 spec 文件里有进程命令行（`boot`/`armed` 记录里也有），所以**命令行里带的凭据会落到磁盘上**。插件为此把日志与 spec 都写成 0600，并在 supervisor 读完后删除 spec；如果你把 token 直接写在命令行里，仍请注意这一点。
-- **不校验新进程真的是"新版本"**。它只是用同样的命令再拉一次；如果新代码本身启动失败，launchd 会看到非零退出并反复重试（本机 ThrottleInterval 未设置，默认 10 秒）。supervisor 路径不会自动重试。
+- **不校验新进程真的是"新版本"**。它只是用同样的命令再拉一次；如果新代码本身启动失败，行为取决于你的 launchd 配置（本机未设 ThrottleInterval，默认 10 秒，会反复重试；别的机器可能只试一次或根本不试）。supervisor 路径不会自动重试。
 - **本 README 里关于 DSH 宿主行为的话，都是实测口径**。热监听只覆盖配置、运行中新增的客户端半边不会被补扫、启动期只有那三个服务——这些是在本机 0.2.0-rc.1 运行时上观察到的行为，不是对任意版本的保证；换版本请重新验证。
 - **桌面版判定依赖 profile 名与工作目录**。桌面就绪判定要求 profile 名是 `desktop` 且 cwd 不变；`scripts/smoke.mjs` 不提供桌面事实，所以它只覆盖 Web 的重启计划。
 
@@ -214,13 +220,24 @@ test/client.test.mjs 把 lib/client.js 放进一个假的 window.__ModuleLoader_
 
 第三方复审（Codex，只读模式）指出：KeepAlive 判定是拿正则扫 `launchctl print` 全文（label/环境变量里出现该词即误判）、鉴权 fail-open、两处 `spawn` 无异步错误处理、健康检查把"端口没释放"也报成功、重启历史不按 armId 配对（跨 profile 会拼出假重启）、arm 先起定时器后写记录、恢复资源在退出后才发现不可写、日志/spec 无权限保护且 spec 不删、崩溃残行会吞掉下一条记录、路由内请求流读取出错会逃逸、客户端把 `armed:false`/`cancelled:false` 显示成成功、`forceStop` 是死代码且写了假的 `forced:true`、README 有几处承诺强于实现。
 
-以上全部修复，并补了对应回归测试（含"label/环境变量里含 keepalive 必须是 null"这类误判回归，以及对每处修复做变异回退、确认新测试真会失败）。
+以上条目均已处理，并补了对应回归测试（含"label/环境变量里含 keepalive 必须是 null"这类误判回归，以及对每处修复做变异回退、确认新测试真会失败）。
+
+其中三处是**有意的取舍**，不是遗漏：「超时不强制终止」；「宿主不写 boot 记录时 supervisor 会持续报失败（服务其实活着）」；以及「已存在的日志文件权限不会被改动」（0600 只在新创建时生效）。
+
+另有三处已知边界不打算在这一版解决，如实记在这里：日志的并发写入（插件与 supervisor 同时 append）仍有一个极小的交错窗口，`appendRecord` 的补换行与追加不是一次原子操作；`readRecords` 只读尾部窗口，日志被高频写入时理论上可能读不到很久以前的记录；已存在的日志文件若权限过宽，插件不会去改它。
 
 | 检查 | 结果 |
 |---|---|
-| 全套单测 | **94/94 通过**（`node --test test/*.test.mjs`，约 36s，含真实拉起 supervisor 的集成测试） |
+| 全套单测 | **104/104 通过**（`node --test test/*.test.mjs`，约 15s，含真实拉起 supervisor 的集成测试） |
 | 实机只读探测 | `node scripts/smoke.mjs <pid>` 对活着的宿主返回 `keepAlive=null`（RunningBoard 提交的桌面 app job 没有 properties 块）并给出"无法确认 KeepAlive"warning，策略判为 supervisor，不误判为 launchd |
 | 实机 HTTP 鉴权 | 真 socket：无 connection 服务时 `127.0.0.1` 的 status/arm 正常 200（本机 web profile 不受影响）；伪造非回环来源的 arm 得 403 且 handler 未执行 |
 | 无 unhandled rejection | 客户端中途断流时进程挂 `unhandledRejection` 监听、退出码 0；handler resolve 出结构化 500 JSON |
 
-> 这一轮改动的**跨文件协议**：supervisor 在预检通过后才写 `supervisor-ready`（带 armId），宿主必须等到"握手 + ready"两条才允许退出——否则预检刚失败、宿主仍会照常退出。两侧都有测试；宿主的等待逻辑在 `index.js` 的 `waitForSupervisor()`，supervisor 侧在 `lib/supervisor.mjs` 的 `preflightOutLog()`。
+> 这一轮改动的**跨文件协议**：supervisor 在预检通过后才写 `supervisor-ready`（带 armId），宿主必须等到"握手 + ready"两条才允许退出——否则预检刚失败、宿主仍会照常退出。supervisor 侧有测试覆盖（含 ready 标记与失败路径）；宿主的等待逻辑在 `index.js` 的 `waitForSupervisor()`，它**没有单测**——`index.js` 依赖 `@deepseek-ai/*` 基座，在当前测试基建下无法直接导入，这一侧只有语法检查与人肉走查，属于已知覆盖缺口。
+
+### 自查补上的两处（同一回合）
+
+修完之后自己又过了一遍新逻辑，发现两个由本轮改动**引入**的问题，一并修掉：
+
+1. **`bootMatched` 会被上一次运行留下的 boot 记录满足**。判定原本只要求"boot 记录的 cwd 匹配、pid 不在排除集内"，而 cwd 每次重启都一样，于是日志里更早那次重启的 boot 会立刻让它为真——新进程其实还没起来。已改为把**新进程自己的 pid** 作为匹配条件（`buildReplacementBootMatcher(cwd, newPid)`），并补了一条"旧运行的 boot 不得当成就绪"的回归测试。桌面路径本来就有时间下界与进程身份复核，不受影响。
+2. **`lib/supervisor.mjs` 不能被 import**：`main()` 在文件底部无条件执行，导入它会把导入方的进程按 supervisor 的退出码结束——这也是它此前只能靠起子进程来测的原因。已加入口守卫（只有该文件本身作为程序运行时才执行 `main()`），真实启动路径不受影响（集成测试即为证据），现在它的内部函数可以被直接单测了。

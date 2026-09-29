@@ -13,7 +13,7 @@
  * allowed to exit, so a failed handshake leaves the server running.
  */
 
-import { writeFile } from 'node:fs/promises'
+import { rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -223,6 +223,10 @@ async function waitForSupervisor(logPath, armId, timeoutMs) {
 export function apply(ctx, config) {
   const logPath = config.logPath
   let armed = null
+  // Distinguishes two arms that reach Date.now() in the same millisecond for the
+  // same pid; armId is the correlation key for the whole handshake, so it must
+  // not be guessable-by-construction or collide.
+  let armSerial = 0
 
   const profileName = () => {
     const profile = serviceOf(ctx, 'profileContext')
@@ -292,6 +296,9 @@ export function apply(ctx, config) {
           desktop: plan.strategy === 'desktop',
         })
         if (!started) {
+          // The supervisor never ran, so nothing else will remove the spec it
+          // would have read — and that file carries this process's argv.
+          await rm(specPath, { force: true }).catch(() => {})
           await appendRecord(logPath, {
             kind: 'aborted',
             at: Date.now(),
@@ -312,6 +319,12 @@ export function apply(ctx, config) {
           if (armed === state) armed = null
           return
         }
+      }
+      // A cancel that landed while we were waiting must still win: without this
+      // recheck the host would commit its exit for a restart the caller revoked.
+      if (state.cancelled) {
+        if (armed === state) armed = null
+        return
       }
       await appendRecord(logPath, {
         kind: 'exiting',
@@ -384,21 +397,27 @@ export function apply(ctx, config) {
       })
     }
 
+    // Reserve the slot BEFORE the first await. Everything below — preflight and
+    // the armed-record write — suspends, and a second call arriving in that
+    // window would otherwise pass the same `armed !== null` check and schedule
+    // a second restart with a second timer that only one of them can cancel.
+    const at = Date.now()
+    const armId = String(at) + '-' + String(facts.pid) + '-' + String(armSerial += 1)
+    const fireAt = at + delaySeconds * 1000
+    const reason = typeof args.reason === 'string' ? args.reason : ''
+    const state = { armId, at, fireAt, delaySeconds, reason, plan, facts, cancelled: false, timer: null }
+    armed = state
+
     // Recovery resources must exist before anything is allowed to exit.
     if (plan.strategy === 'supervisor' || plan.strategy === 'desktop') {
       const blocked = await preflightRecovery(config.childLogPath)
       if (blocked !== null) {
+        if (armed === state) armed = null
         notes.push('未安排重启：supervisor 的子进程日志不可写（' + blocked + '）；'
           + '先修好再重启，否则进程退出后拉不起来。')
         return planResult(plan, facts, { logPath, armed: false, notes })
       }
     }
-
-    const at = Date.now()
-    const armId = String(at) + '-' + String(facts.pid)
-    const fireAt = at + delaySeconds * 1000
-    const reason = typeof args.reason === 'string' ? args.reason : ''
-    const state = { armId, at, fireAt, delaySeconds, reason, plan, facts, cancelled: false, timer: null }
 
     // Persist the arm BEFORE the timer exists: a log write that fails must not
     // leave a restart scheduled with nothing on disk to explain it.
@@ -419,21 +438,21 @@ export function apply(ctx, config) {
         port: facts.port,
       })
     } catch (error) {
+      if (armed === state) armed = null
       notes.push('未安排重启：写入重启记录失败（' + errorMessage(error) + '）。')
       return planResult(plan, facts, { logPath, armed: false, notes })
     }
 
     state.timer = setTimeout(() => { void fire(state) }, delaySeconds * 1000)
     state.timer.unref?.()
-    armed = state
 
     notes.push('重启记录（armed -> exiting -> boot）写入 ' + logPath + '，重启后用 dsh_restart_status 复核。')
     if (plan.strategy === 'supervisor') {
       notes.push('无 KeepAlive 托管：届时先派发 detached supervisor 并完成握手；握手失败会取消退出，服务保持运行。')
     }
     if (facts.healthUrl === '') {
-      notes.push('没有可探测的端点（读不到 --port 且 healthUrl 为空）：'
-        + 'supervisor 拉起后无法用健康检查证明服务已恢复，结果会如实标注为未确认。')
+      notes.push('没有可探测的端点（读不到 --port 且 healthUrl 为空）：拉起仍会执行，'
+        + '但"服务已恢复"只能由新进程自己写的 boot 记录来确认，不会有端口层面的证据。')
     }
     if (delaySeconds > 0) {
       notes.push('在 ' + stamp(fireAt) + ' 之前调用 dsh_restart_cancel 可以取消。')

@@ -98,18 +98,32 @@ test('parseKeepAlive understands every boolean rendering', () => {
   assert.equal(parseKeepAlive(withValue('0')), false)
   assert.equal(parseKeepAlive(withValue('false')), false)
   assert.equal(parseKeepAlive(withValue('No')), false)
-  // A nested dict is still a configured KeepAlive policy.
+  // A nested dict is a CONDITIONAL policy, and this plugin cannot evaluate it.
+  // Reading it as "launchd will bring us back" is how a service gets stranded:
+  // { SuccessfulExit = false } restarts only on FAILURE, and this plugin asks
+  // for exit code 0. Unknown policy must resolve to null -> supervisor.
   assert.equal(parseKeepAlive([
     'gui/501/com.dsh.x = {',
     TAB + 'properties = {',
     TAB + TAB + 'keepalive = {',
-    TAB + TAB + TAB + 'pathstate = {',
+    TAB + TAB + TAB + 'pathexists = {',
     TAB + TAB + TAB + TAB + '/tmp/watch => true',
     TAB + TAB + TAB + '}',
     TAB + TAB + '}',
     TAB + '}',
     '}',
-  ].join('\n')), true)
+  ].join('\n')), null)
+  assert.equal(parseKeepAlive([
+    'gui/501/com.dsh.x = {',
+    TAB + 'properties = {',
+    TAB + TAB + 'keepalive = {',
+    TAB + TAB + TAB + 'successfulexit = 0',
+    TAB + TAB + '}',
+    TAB + '}',
+    '}',
+  ].join('\n')), null)
+  // An unfamiliar scalar rendering is equally unproven.
+  assert.equal(parseKeepAlive(withValue('conditional')), null)
   // An empty value asserts nothing.
   assert.equal(parseKeepAlive(withValue('')), null)
 })

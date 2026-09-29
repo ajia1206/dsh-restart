@@ -54,6 +54,39 @@ async function outcomeOf(logPath, armId) {
 }
 
 /**
+ * A replacement for a headless host: it writes its own boot record and then
+ * stays alive. No port is involved, so that record is the only hard evidence.
+ * @param logPath - restart log it appends its boot record to.
+ * @param cwd - working directory recorded in the boot record.
+ */
+function bootingHeadlessCommand(logPath, cwd) {
+  return [
+    "const fs=require('node:fs')",
+    'fs.appendFileSync(' + JSON.stringify(logPath) + ", JSON.stringify({kind:'boot',at:Date.now(),pid:process.pid,ppid:process.ppid,cwd:" + JSON.stringify(cwd) + "})+'\\n')",
+    'setInterval(()=>{},1000)',
+  ].join('\n')
+}
+
+/**
+ * A replacement whose only job is to prove whether it was started at all.
+ * @param markerPath - file it creates on start.
+ */
+function markerCommand(markerPath) {
+  return "require('node:fs').writeFileSync(" + JSON.stringify(markerPath) + ",'started')"
+}
+
+/**
+ * Record the host's own exit commitment, the way the plugin does after the
+ * handshake. The supervisor refuses to relaunch without it.
+ * @param logPath - restart log path.
+ * @param armId - arm identifier.
+ * @param pid - the host pid.
+ */
+async function commitExit(logPath, armId, pid) {
+  await appendRecord(logPath, { kind: 'exiting', at: Date.now(), armId, pid })
+}
+
+/**
  * Run a supervisor to completion and return its exit code plus its outcome.
  * @param specPath - spec file path.
  * @param logPath - restart log path.
@@ -160,6 +193,8 @@ test('the supervisor waits for the old pid, restarts it and health-checks it', a
     // The spec is consumed, not kept: it can carry credential-style arguments.
     assert.equal(await waitForRemoval(specPath), true, 'the spec file should be deleted after being read')
 
+    // The host commits its exit only after the handshake and the preflight.
+    await commitExit(logPath, 'test-arm', old.pid)
     old.kill('SIGTERM')
     const supervisorExit = await waitForExit(supervisor.pid, { timeoutMs: 25000, intervalMs: 200 })
     assert.equal(supervisorExit, true, 'the supervisor should finish on its own')
@@ -211,6 +246,7 @@ test('the supervisor records a failure when the replacement never serves the por
     }), 'utf8')
 
     const supervisor = spawn(EXEC, [SUPERVISOR, specPath], { stdio: 'ignore' })
+    await commitExit(logPath, 'test-fail', old.pid)
     old.kill('SIGTERM')
     await waitForExit(supervisor.pid, { timeoutMs: 25000, intervalMs: 200 })
 
@@ -250,6 +286,7 @@ test('a replacement that never writes its boot record is not reported as a succe
       logPath,
     }), 'utf8')
 
+    await commitExit(logPath, 'test-noboot', old.pid)
     old.kill('SIGTERM')
     const outcome = await runSupervisor(specPath, logPath, 'test-noboot')
 
@@ -293,6 +330,7 @@ test('an unhandled spawn error is recorded instead of crashing the supervisor', 
 
     old.kill('SIGTERM')
     const supervisor = spawn(EXEC, [SUPERVISOR, specPath], { stdio: 'ignore' })
+    await commitExit(logPath, 'test-spawn', old.pid)
     const supervisorExit = await waitForExit(supervisor.pid, { timeoutMs: 25000, intervalMs: 100 })
 
     assert.equal(supervisorExit, true, 'the supervisor must never hang or crash on a spawn error')
@@ -352,7 +390,7 @@ test('an unusable child-log directory is preflighted before the host is allowed 
   }
 })
 
-test('a replacement that never lets go of the port cannot be called a success', async () => {
+test('a port that keeps answering is recorded honestly but must not stop the relaunch', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsr-sup-'))
   const port = await freePort()
   const logPath = join(dir, 'restart.log')
@@ -375,17 +413,22 @@ test('a replacement that never lets go of the port cannot be called a success', 
       healthTimeoutMs: 2000,
       healthIntervalMs: 200,
       exitTimeoutMs: 500,
+      downTimeoutMs: 800,
       outLogPath,
       logPath,
     }), 'utf8')
 
+    await commitExit(logPath, 'test-held', 0x7ffffff0)
     const outcome = await runSupervisor(specPath, logPath, 'test-held')
     assert.ok(outcome, 'the supervisor should record an outcome')
-    assert.equal(outcome.portReleased, false, 'the port never stopped answering')
+    assert.equal(outcome.portReleased, false, 'the port never stopped accepting connections')
     assert.equal(outcome.bootMatched, false)
     assert.equal(outcome.ok, false, 'a port that never went down must not be reported as success: ' + JSON.stringify(outcome))
     assert.match(outcome.error, /端口/, 'the reason must explain the port: ' + outcome.error)
+    assert.match(outcome.error, /拉起/, 'the reason must admit the relaunch was attempted: ' + outcome.error)
+    // The relaunch really happened even though the evidence was bad.
     replacementPid = outcome.newPid
+    assert.ok(Number.isInteger(replacementPid), 'the replacement must have been started: ' + JSON.stringify(outcome))
   } finally {
     if (old !== null && processAlive(old.pid)) old.kill('SIGKILL')
     if (replacementPid !== null && processAlive(replacementPid)) process.kill(replacementPid, 'SIGKILL')
@@ -393,30 +436,77 @@ test('a replacement that never lets go of the port cannot be called a success', 
   }
 })
 
-test('an empty health URL is reported as "nothing to probe" rather than a silent failure', async () => {
+test('an empty health URL still relaunches the host and is judged on the boot record', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsr-sup-'))
   const logPath = join(dir, 'restart.log')
+  const outLogPath = join(dir, 'child.log')
   const specPath = join(dir, 'spec.json')
+  let replacementPid = null
   try {
     await writeFile(specPath, JSON.stringify({
       armId: 'test-nourl',
+      // The host is already gone; headless means there is no endpoint at all.
       oldPid: 0x7ffffff0,
       cwd: dir,
-      command: { execPath: EXEC, execArgv: [], scriptPath: '', args: ['-e', 'process.exit(0)'] },
+      command: { execPath: EXEC, execArgv: [], scriptPath: '', args: ['-e', bootingHeadlessCommand(logPath, dir)] },
       healthUrl: '',
-      healthTimeoutMs: 1000,
+      healthTimeoutMs: 6000,
+      healthIntervalMs: 100,
+      exitTimeoutMs: 500,
+      outLogPath,
+      logPath,
+    }), 'utf8')
+
+    await commitExit(logPath, 'test-nourl', 0x7ffffff0)
+    const outcome = await runSupervisor(specPath, logPath, 'test-nourl')
+    assert.ok(outcome, 'the supervisor should record an outcome')
+    assert.equal(outcome.portReleased, null, 'no endpoint means null, never "not released": ' + JSON.stringify(outcome))
+    assert.equal(outcome.bootMatched, true, 'the headless replacement did write its own boot record')
+    assert.equal(outcome.ok, true, 'a headless host must not be a recorded failure when the replacement boots: ' + JSON.stringify(outcome))
+    replacementPid = outcome.newPid
+    assert.ok(Number.isInteger(replacementPid), 'the replacement must have been started: ' + JSON.stringify(outcome))
+    assert.equal(processAlive(replacementPid), true, 'the headless replacement should still be running')
+    const records = await readRecords(logPath)
+    assert.ok(records.some(record => record.kind === 'boot' && record.pid === replacementPid),
+      'the log must carry the replacement own boot record')
+    assert.match(outcome.notes, /没有可观测端点/, 'the record must say there was nothing to observe: ' + outcome.notes)
+  } finally {
+    if (replacementPid !== null && processAlive(replacementPid)) process.kill(replacementPid, 'SIGKILL')
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a headless replacement that writes no boot record is reported as unverifiable', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsr-sup-'))
+  const logPath = join(dir, 'restart.log')
+  const specPath = join(dir, 'spec.json')
+  let replacementPid = null
+  try {
+    await writeFile(specPath, JSON.stringify({
+      armId: 'test-nourl-noboot',
+      oldPid: 0x7ffffff0,
+      cwd: dir,
+      command: { execPath: EXEC, execArgv: [], scriptPath: '', args: ['-e', 'setInterval(()=>{},1000)'] },
+      healthUrl: '',
+      healthTimeoutMs: 600,
       healthIntervalMs: 100,
       exitTimeoutMs: 500,
       outLogPath: join(dir, 'child.log'),
       logPath,
     }), 'utf8')
 
-    const outcome = await runSupervisor(specPath, logPath, 'test-nourl')
+    await commitExit(logPath, 'test-nourl-noboot', 0x7ffffff0)
+    const outcome = await runSupervisor(specPath, logPath, 'test-nourl-noboot')
     assert.ok(outcome, 'the supervisor should record an outcome')
-    assert.equal(outcome.ok, false)
-    assert.equal(outcome.portReleased, false)
-    assert.match(outcome.error, /端点/, 'the reason must say there is no endpoint: ' + outcome.error)
+    assert.equal(outcome.portReleased, null, 'no endpoint means null: ' + JSON.stringify(outcome))
+    assert.equal(outcome.bootMatched, false)
+    assert.equal(outcome.ok, false, 'without any hard evidence this must not be a success')
+    assert.match(outcome.error, /没有可观测端点/, 'the reason must say there was no endpoint: ' + outcome.error)
+    assert.match(outcome.error, /boot/, 'the reason must name the missing boot record: ' + outcome.error)
+    replacementPid = outcome.newPid
+    assert.ok(Number.isInteger(replacementPid), 'the replacement was still started: ' + JSON.stringify(outcome))
   } finally {
+    if (replacementPid !== null && processAlive(replacementPid)) process.kill(replacementPid, 'SIGKILL')
     await rm(dir, { recursive: true, force: true })
   }
 })
@@ -427,6 +517,7 @@ test('spawn 的异步错误不会以未捕获异常终止 supervisor', async () 
   let old = null
   try {
     await appendRecord(logPath, { kind: 'supervisor', at: Date.now(), armId: 'test-crash', oldPid: 0x7ffffff0 })
+    await commitExit(logPath, 'test-crash', 0x7ffffff0)
     const specPath = join(dir, 'spec.json')
     await writeFile(specPath, JSON.stringify({
       armId: 'test-crash',
@@ -467,6 +558,7 @@ test('a writable child-log directory is created when it does not exist yet', asy
       logPath,
     }), 'utf8')
 
+    await commitExit(logPath, 'test-mkdir', 0x7ffffff0)
     const outcome = await runSupervisor(specPath, logPath, 'test-mkdir')
     assert.ok(outcome, 'the supervisor should record an outcome')
     // The preflight succeeded, so the failure that follows is about the port.
@@ -518,6 +610,7 @@ test('a post-handshake failure is reported to the configured log, not a guessed 
       logPath,
     }), 'utf8')
 
+    await commitExit(logPath, 'arm-custom', 0x7ffffff0)
     const outcome = await runSupervisor(specPath, logPath, 'arm-custom')
     assert.ok(outcome, 'the failure must land in the configured log')
     assert.equal(outcome.ok, false)
@@ -527,4 +620,152 @@ test('a post-handshake failure is reported to the configured log, not a guessed 
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+test('the boot matcher requires the replacement own pid, not just any boot', async () => {
+  const { buildBootMatcher, buildReplacementBootMatcher } = await import('../lib/supervisor.mjs')
+  const stale = { kind: 'boot', pid: 111, cwd: '/w' }
+  const fresh = { kind: 'boot', pid: 222, cwd: '/w' }
+  // The shape matcher alone accepts both — which is exactly why the pid must
+  // be part of the predicate: cwd is identical across restarts.
+  assert.equal(buildBootMatcher('/w')(stale), true)
+  assert.equal(buildBootMatcher('/w')(fresh), true)
+  assert.equal(buildReplacementBootMatcher('/w', 222)(stale), false)
+  assert.equal(buildReplacementBootMatcher('/w', 222)(fresh), true)
+  // A record from another working directory is never this replacement.
+  assert.equal(buildReplacementBootMatcher('/w', 222)({ kind: 'boot', pid: 222, cwd: '/other' }), false)
+})
+
+test('a stale boot record from an earlier run cannot satisfy bootMatched', async () => {
+  const { buildReplacementBootMatcher, waitForBootRecord } = await import('../lib/supervisor.mjs')
+  const dir = await mkdtemp(join(tmpdir(), 'dsr-stale-'))
+  try {
+    const logPath = join(dir, 'restart.log')
+    // An earlier restart already left a boot record with the same cwd in this
+    // log. The new replacement (pid 999) never writes one.
+    await appendRecord(logPath, { kind: 'boot', at: 1000, pid: 111, cwd: dir, profile: 'web' })
+    await appendRecord(logPath, { kind: 'armed', at: 2000, armId: 'A', pid: 111 })
+    await appendRecord(logPath, { kind: 'exiting', at: 3000, armId: 'A', pid: 111 })
+    const matched = await waitForBootRecord(logPath, buildReplacementBootMatcher(dir, 999), {
+      timeoutMs: 600, intervalMs: 50, excluded: [111, process.pid],
+    })
+    assert.equal(matched, false, '旧运行的 boot 记录不得当成新进程已就绪')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('without an exiting commitment the supervisor must not relaunch', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsr-sup-'))
+  const logPath = join(dir, 'restart.log')
+  const marker = join(dir, 'started.marker')
+  const specPath = join(dir, 'spec.json')
+  try {
+    await writeFile(specPath, JSON.stringify({
+      armId: 'test-nocommit',
+      oldPid: 0x7ffffff0,
+      cwd: dir,
+      command: { execPath: EXEC, execArgv: [], scriptPath: '', args: ['-e', markerCommand(marker)] },
+      healthUrl: '',
+      healthTimeoutMs: 600,
+      healthIntervalMs: 100,
+      exitTimeoutMs: 300,
+      exitCommitTimeoutMs: 700,
+      outLogPath: join(dir, 'child.log'),
+      logPath,
+    }), 'utf8')
+
+    const outcome = await runSupervisor(specPath, logPath, 'test-nocommit')
+    assert.ok(outcome, 'the supervisor should record an outcome')
+    assert.equal(outcome.ok, false, 'the host never committed an exit')
+    assert.equal(outcome.newPid, null, 'nothing may be started: ' + JSON.stringify(outcome))
+    assert.equal(outcome.portReleased, null, 'there was no endpoint to observe')
+    assert.match(outcome.error, /exiting/, 'the reason must name the missing commitment: ' + outcome.error)
+    await assert.rejects(access(marker), 'the replacement must never have been started')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('an aborted arm is recorded as cancelled and never relaunched', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsr-sup-'))
+  const logPath = join(dir, 'restart.log')
+  const marker = join(dir, 'started.marker')
+  const specPath = join(dir, 'spec.json')
+  try {
+    // The host gave up on the exit after the handshake timed out, and it is
+    // still running: relaunching would only add a duplicate instance.
+    await appendRecord(logPath, { kind: 'armed', at: Date.now(), armId: 'test-aborted', pid: 0x7ffffff0 })
+    await appendRecord(logPath, { kind: 'aborted', at: Date.now(), armId: 'test-aborted', reason: 'handshake timeout' })
+    await writeFile(specPath, JSON.stringify({
+      armId: 'test-aborted',
+      oldPid: 0x7ffffff0,
+      cwd: dir,
+      command: { execPath: EXEC, execArgv: [], scriptPath: '', args: ['-e', markerCommand(marker)] },
+      healthUrl: 'http://127.0.0.1:1/',
+      healthTimeoutMs: 600,
+      healthIntervalMs: 100,
+      exitTimeoutMs: 300,
+      exitCommitTimeoutMs: 700,
+      outLogPath: join(dir, 'child.log'),
+      logPath,
+    }), 'utf8')
+
+    const outcome = await runSupervisor(specPath, logPath, 'test-aborted')
+    assert.ok(outcome, 'the supervisor should record an outcome')
+    assert.equal(outcome.ok, false)
+    assert.equal(outcome.newPid, null, 'nothing may be started: ' + JSON.stringify(outcome))
+    assert.match(outcome.error, /aborted/, 'the reason must name the cancellation: ' + outcome.error)
+    await assert.rejects(access(marker), 'the replacement must never have been started')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('waitForExitCommit reads this arm commitment and nothing else', async () => {
+  const { waitForExitCommit } = await import('../lib/supervisor.mjs')
+  const dir = await mkdtemp(join(tmpdir(), 'dsr-commit-'))
+  try {
+    const logPath = join(dir, 'restart.log')
+    assert.equal(await waitForExitCommit(logPath, 'A', { timeoutMs: 150, intervalMs: 50 }), null,
+      'an empty log is not a commitment')
+    await appendRecord(logPath, { kind: 'cancelled', at: Date.now(), armId: 'B' })
+    assert.equal(await waitForExitCommit(logPath, 'A', { timeoutMs: 150, intervalMs: 50 }), null,
+      'another arm record must not count')
+    await appendRecord(logPath, { kind: 'aborted', at: Date.now(), armId: 'A' })
+    assert.equal(await waitForExitCommit(logPath, 'A', { timeoutMs: 300, intervalMs: 50 }), 'aborted')
+    await appendRecord(logPath, { kind: 'exiting', at: Date.now(), armId: 'A' })
+    assert.equal(await waitForExitCommit(logPath, 'A', { timeoutMs: 300, intervalMs: 50 }), 'exiting',
+      'a real commitment wins even after an earlier abort')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('isPortClosed decides port release at the socket layer', async () => {
+  const { isPortClosed, parseHealthEndpoint } = await import('../lib/supervisor.mjs')
+  // A listener that only fails still holds the port: HTTP 5xx is not a release.
+  const server = createServer((_request, response) => { response.statusCode = 503; response.end('down') })
+  await new Promise(resolve => { server.listen(0, '127.0.0.1', resolve) })
+  const port = server.address().port
+  try {
+    assert.equal(await isPortClosed('127.0.0.1', port, { timeoutMs: 500 }), false,
+      'a live 503 listener must never be read as a released port')
+    assert.equal(await isPortClosed('127.0.0.1', await freePort(), { timeoutMs: 500 }), true,
+      'a refused connection means the port is free')
+  } finally {
+    await new Promise(resolve => { server.close(resolve) })
+  }
+  assert.equal(await isPortClosed('127.0.0.1', port, { timeoutMs: 500 }), true,
+    'the port must count as released once the listener is gone')
+
+  assert.deepEqual(parseHealthEndpoint(''), { ok: false, kind: 'missing', error: '', host: '', port: 0 })
+  const invalid = parseHealthEndpoint('definitely not a url')
+  assert.equal(invalid.ok, false)
+  assert.equal(invalid.kind, 'invalid')
+  assert.ok(invalid.error.length > 0, 'an unparseable URL must carry an explanation instead of throwing')
+  assert.deepEqual(parseHealthEndpoint('http://127.0.0.1:3799/health'),
+    { ok: true, kind: 'observable', host: '127.0.0.1', port: 3799 })
+  assert.deepEqual(parseHealthEndpoint('http://127.0.0.1/'),
+    { ok: true, kind: 'observable', host: '127.0.0.1', port: 80 })
 })
