@@ -13,7 +13,6 @@
  * allowed to exit, so a failed handshake leaves the server running.
  */
 
-import { spawn } from 'node:child_process'
 import { writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -26,6 +25,7 @@ import { desktopTarget, desktopExecutable } from './lib/desktop.js'
 import { registerRestartRoutes } from './lib/http.js'
 import { appendRecord, buildHistory, readRecords } from './lib/log.js'
 import { buildPlan } from './lib/plan.js'
+import { preflightRecovery, startSupervisor } from './lib/spawn.js'
 import {
   errorMessage, findListeningPort, findSupervisorJob, formatCommand,
   parseLaunchctlList, parsePort, probeHealth, readCommand,
@@ -61,7 +61,11 @@ export const Config = Schema.object({
   healthIntervalMs: Schema.number().default(500)
     .description('健康检查轮询间隔毫秒数。'),
   exitTimeoutMs: Schema.number().default(45000)
-    .description('supervisor 等待旧进程退出的上限毫秒数，超过后升级为 SIGTERM/SIGKILL。'),
+    .description('supervisor 等待旧进程退出的上限毫秒数；超时不强制终止任何进程，直接如实报告失败。'),
+  trustParentJob: Schema.boolean().default(false)
+    .description('只有当本进程本身是 launchd 任务的主进程时才走 launchd 直退；'
+      + '若该任务的主进程只是本进程的父进程，默认不信它会随本进程退出，改用 supervisor 兜底。'
+      + '明确知道自己父进程会随子进程退出时，才把这项打开。'),
   bootHistoryLimit: Schema.number().default(5)
     .description('状态里保留的最近重启次数。'),
 })
@@ -129,6 +133,7 @@ async function gatherFacts(ctx, config) {
   return {
     pid, ppid, jobs, job, keepAlive,
     command, cwd, innerArgs, port, healthUrl, uid, desktop,
+    trustParentJob: config.trustParentJob === true,
   }
 }
 
@@ -183,17 +188,28 @@ function planResult(plan, facts, extra) {
 }
 
 /**
- * Wait until the supervisor handshake record for this arm appears.
+ * Wait until the supervisor has both handshaken and passed its preflight.
+ *
+ * The handshake alone is not enough to justify exiting: the supervisor still
+ * has to prove that the replacement's log destination is writable, and it
+ * publishes that as a separate `supervisor-ready` record for this arm. Waiting
+ * for both is what makes a failed preflight keep the service up instead of
+ * letting the plugin commit its exit anyway.
  * @param logPath - restart log path.
  * @param armId - arm identifier.
  * @param timeoutMs - bound.
- * @returns true when the handshake was observed.
+ * @returns true when this arm's supervisor is confirmed ready.
  */
 async function waitForSupervisor(logPath, armId, timeoutMs) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const records = await readRecords(logPath, 200)
-    if (records.some(record => record.kind === 'supervisor' && record.armId === armId)) return true
+    const forArm = records.filter(record => record.armId === armId)
+    // A recorded failure means the exit must not happen at all; stop waiting.
+    if (forArm.some(record => record.kind === 'supervised' && record.ok === false)) return false
+    const handshake = forArm.some(record => record.kind === 'supervisor')
+    const ready = forArm.some(record => record.kind === 'supervisor-ready')
+    if (handshake && ready) return true
     await sleep(200)
   }
   return false
@@ -254,6 +270,7 @@ export function apply(ctx, config) {
     try {
       if (plan.strategy === 'supervisor' || plan.strategy === 'desktop') {
         const specPath = join(dirname(logPath), 'dsh-restart-spec-' + armId + '.json')
+        // 0600: the spec carries this process's argv, which can hold tokens.
         await writeFile(specPath, JSON.stringify({
           armId,
           oldPid: facts.pid,
@@ -266,21 +283,31 @@ export function apply(ctx, config) {
           exitTimeoutMs: config.exitTimeoutMs,
           outLogPath: config.childLogPath,
           logPath,
-        }, null, 2), 'utf8')
-        const child = spawn(process.execPath, [SUPERVISOR_PATH, specPath], {
-          detached: true,
-          stdio: 'ignore',
+        }, null, 2), { encoding: 'utf8', mode: 0o600 })
+        const started = await startSupervisor({
+          execPath: process.execPath,
+          supervisorPath: SUPERVISOR_PATH,
+          specPath,
           cwd: facts.cwd,
-          env: plan.strategy === 'desktop' ? { ...process.env, ELECTRON_RUN_AS_NODE: '1' } : process.env,
+          desktop: plan.strategy === 'desktop',
         })
-        child.unref()
+        if (!started) {
+          await appendRecord(logPath, {
+            kind: 'aborted',
+            at: Date.now(),
+            armId,
+            reason: 'supervisor 进程未能启动，已取消退出以保住运行中的服务',
+          })
+          if (armed === state) armed = null
+          return
+        }
         const handshake = await waitForSupervisor(logPath, armId, 8000)
         if (!handshake) {
           await appendRecord(logPath, {
             kind: 'aborted',
             at: Date.now(),
             armId,
-            reason: 'supervisor 未在 8s 内完成握手，已取消退出以保住运行中的服务',
+            reason: 'supervisor 未在 8s 内确认就绪（握手或恢复资源预检未通过），已取消退出以保住运行中的服务',
           })
           if (armed === state) armed = null
           return
@@ -357,34 +384,56 @@ export function apply(ctx, config) {
       })
     }
 
+    // Recovery resources must exist before anything is allowed to exit.
+    if (plan.strategy === 'supervisor' || plan.strategy === 'desktop') {
+      const blocked = await preflightRecovery(config.childLogPath)
+      if (blocked !== null) {
+        notes.push('未安排重启：supervisor 的子进程日志不可写（' + blocked + '）；'
+          + '先修好再重启，否则进程退出后拉不起来。')
+        return planResult(plan, facts, { logPath, armed: false, notes })
+      }
+    }
+
     const at = Date.now()
     const armId = String(at) + '-' + String(facts.pid)
     const fireAt = at + delaySeconds * 1000
     const reason = typeof args.reason === 'string' ? args.reason : ''
     const state = { armId, at, fireAt, delaySeconds, reason, plan, facts, cancelled: false, timer: null }
+
+    // Persist the arm BEFORE the timer exists: a log write that fails must not
+    // leave a restart scheduled with nothing on disk to explain it.
+    try {
+      await appendRecord(logPath, {
+        kind: 'armed',
+        at,
+        armId,
+        pid: facts.pid,
+        ppid: facts.ppid,
+        strategy: plan.strategy,
+        label: plan.label,
+        delaySeconds,
+        reason,
+        profile: profileName(),
+        command: formatCommand(facts.command),
+        cwd: facts.cwd,
+        port: facts.port,
+      })
+    } catch (error) {
+      notes.push('未安排重启：写入重启记录失败（' + errorMessage(error) + '）。')
+      return planResult(plan, facts, { logPath, armed: false, notes })
+    }
+
     state.timer = setTimeout(() => { void fire(state) }, delaySeconds * 1000)
     state.timer.unref?.()
     armed = state
 
-    await appendRecord(logPath, {
-      kind: 'armed',
-      at,
-      armId,
-      pid: facts.pid,
-      ppid: facts.ppid,
-      strategy: plan.strategy,
-      label: plan.label,
-      delaySeconds,
-      reason,
-      profile: profileName(),
-      command: formatCommand(facts.command),
-      cwd: facts.cwd,
-      port: facts.port,
-    })
-
     notes.push('重启记录（armed -> exiting -> boot）写入 ' + logPath + '，重启后用 dsh_restart_status 复核。')
     if (plan.strategy === 'supervisor') {
       notes.push('无 KeepAlive 托管：届时先派发 detached supervisor 并完成握手；握手失败会取消退出，服务保持运行。')
+    }
+    if (facts.healthUrl === '') {
+      notes.push('没有可探测的端点（读不到 --port 且 healthUrl 为空）：'
+        + 'supervisor 拉起后无法用健康检查证明服务已恢复，结果会如实标注为未确认。')
     }
     if (delaySeconds > 0) {
       notes.push('在 ' + stamp(fireAt) + ' 之前调用 dsh_restart_cancel 可以取消。')
@@ -599,9 +648,12 @@ export function apply(ctx, config) {
       },
       render: (_args, value) => [{
         type: 'text',
+        // cancelled:false has two very different causes — nothing was armed,
+        // or the restart already started and can no longer be cancelled — so
+        // the host's own explanation is what gets shown.
         text: value.cancelled
           ? '已取消原定于 ' + value.fireAt + ' 的重启。'
-          : '当前没有已安排的重启，无需取消。',
+          : (value.notes?.[0] ?? '当前没有已安排的重启，无需取消。'),
       }],
     },
     async execute() {
@@ -701,6 +753,16 @@ export function apply(ctx, config) {
       return await readStatus()
     },
   }))
+
+  // A pending arm must not outlive the plugin: unloading the bundle while a
+  // restart is scheduled would otherwise fire a timer nobody can cancel.
+  ctx.effect(() => () => {
+    if (armed !== null) {
+      if (armed.timer !== null) clearTimeout(armed.timer)
+      armed.cancelled = true
+      armed = null
+    }
+  }, 'dsh-restart: pending restart timer')
 
   // The browser control is web-only, so webServer is injected optionally
   // instead of being declared in the inject list: headless and other

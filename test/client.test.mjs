@@ -10,16 +10,52 @@ const HOST_SOURCE = await readFile(new URL('../lib/http.js', import.meta.url), '
 /**
  * Minimal React stub. useState hands back the initial value unless the call
  * index is overridden, so a spec can drive one render state per index.
+ * Each hook records its value in `holder.values`; the setter also writes the
+ * new value into `holder.last` and re-renders the component, exactly like
+ * React would, so a spec can assert the resulting UI instead of raw setters.
  * @param overrides - useState call index to value.
+ * @param holder - receives the per-hook value lists, `last`, and the root tree.
  */
-function fakeReact(overrides = {}) {
+function fakeReact(overrides = {}, holder = {}) {
   let call = 0
+  // The holder outlives every render, so a spec can assert what a setter did
+  // even though the re-render below builds a fresh stub.
+  holder.values = holder.values ?? []
+  holder.last = holder.last ?? []
+  holder.render = holder.render ?? (() => { throw new Error('this spec must set holder.render') })
+  const createElement = (type, props, ...children) => {
+    if (typeof type === 'function') {
+      call = 0
+      const rendered = type(props)
+      if (rendered !== null && rendered !== undefined) holder.tree = rendered
+      return rendered
+    }
+    return { type, props, children }
+  }
   return {
-    createElement: (type, props, ...children) => ({ type, props, children }),
+    createElement,
     useState: initial => {
       const index = call
       call += 1
-      return [Object.prototype.hasOwnProperty.call(overrides, index) ? overrides[index] : initial, () => {}]
+      // The first render of a hook seeds its record; later re-renders must not
+      // reset it, or a spec could no longer see what a setter wrote.
+      const values = holder.values[index] ?? []
+      if (values.length === 0) {
+        values.push(Object.prototype.hasOwnProperty.call(overrides, index) ? overrides[index] : initial)
+      }
+      holder.values[index] = values
+      const setter = value => {
+        values.push(value)
+        holder.last[index] = value
+        // Re-render against the recorded values so the assertion sees the new
+        // UI: React would do this, and only the component is stateful here.
+        const rerenderOverrides = {}
+        for (let slot = 0; slot < holder.last.length; slot += 1) {
+          if (holder.last[slot] !== undefined) rerenderOverrides[slot] = holder.last[slot]
+        }
+        holder.tree = holder.render(rerenderOverrides)
+      }
+      return [values[values.length - 1], setter]
     },
     useEffect: () => {},
     useRef: () => ({ current: null }),
@@ -179,6 +215,162 @@ test('the armed branch replaces the form with the countdown and a cancel action'
   const text = textOf(dialog)
   assert.ok(text.includes('已安排重启'), text)
   assert.ok(text.includes('18:00:00'), text)
+})
+
+/** A fetch stub: records every call and answers from a path-keyed script. */
+function fakeFetch(routes) {
+  const calls = []
+  const fetch = async (path, init) => {
+    calls.push({ path, init })
+    const scripted = routes[path]
+    if (scripted === undefined) throw new Error('no scripted response for ' + path)
+    const answered = typeof scripted === 'function' ? scripted(calls.length) : scripted
+    return {
+      ok: answered.ok !== false,
+      status: answered.status ?? 200,
+      json: async () => answered.body,
+    }
+  }
+  fetch.calls = calls
+  return fetch
+}
+
+/** Let one click's promise chain settle, including the fetch stub's awaits. */
+async function flush() {
+  for (let round = 0; round < 5; round += 1) await new Promise(resolve => setImmediate(resolve))
+}
+
+/**
+ * Render the control with a fetch stub installed.
+ * @param react - React stub carrying the state holder.
+ * @param routes - fetch script keyed by path.
+ */
+function renderWithFetch(react, holder, routes) {
+  globalThis.fetch = fakeFetch(routes)
+  // Re-render by re-registering the component through a fresh stub that shares
+  // the same holder: that is what keeps the holder accurate, because it records
+  // every state hook the component reads.
+  holder.render = overrides => registerControl(fakeReact(overrides, holder)).Component()
+  holder.tree = registerControl(react).Component()
+}
+
+/** Find the single button whose visible label matches. */
+function buttonByLabel(root, label) {
+  const found = findAll(root, node => node.type === 'button' && labelOf(node) === label)
+  assert.equal(found.length, 1, 'expected exactly one "' + label + '" button, found ' + found.length)
+  return found[0]
+}
+
+test('the confirm action enters the countdown when the host armed the restart', async () => {
+  const holder = {}
+  const react = fakeReact({ 0: STATUS, 1: true }, holder)
+  renderWithFetch(react, holder, {
+    '/dsh-restart/arm': {
+      body: {
+        armed: true,
+        delaySeconds: 30,
+        fireAt: '2026-09-18 18:00:30',
+        logPath: '/tmp/x.log',
+        summary: '将派发 detached supervisor。',
+      },
+    },
+    '/dsh-restart/status': { body: STATUS },
+  })
+  buttonByLabel(holder.tree, '确认重启').props.onClick()
+  await flush()
+  // useState index 4 is the armed state: its last recorded value is the
+  // scheduled restart, and it started from the empty initial state.
+  const armedValues = holder.values[4]
+  assert.equal(armedValues.length, 2)
+  assert.equal(armedValues[0], null)
+  assert.equal(armedValues[1].fireAt, '2026-09-18 18:00:30')
+  assert.equal(armedValues[1].delaySeconds, 30)
+  assert.equal(typeof armedValues[1].at, 'number')
+  const text = textOf(holder.tree)
+  assert.ok(text.includes('已安排重启'), text)
+  assert.ok(text.includes('18:00:30'), text)
+})
+
+test('an arm answered with armed:false shows the explanation and starts no countdown', async () => {
+  const holder = {}
+  const react = fakeReact({ 0: STATUS, 1: true }, holder)
+  renderWithFetch(react, holder, {
+    '/dsh-restart/arm': {
+      body: {
+        armed: false,
+        dryRun: false,
+        restartable: false,
+        summary: '拒绝重启：无法确认桌面主进程及 IPC 连接，请使用桌面原生重启菜单。',
+        notes: ['未安排重启：无法确认桌面主进程及 IPC 连接，请使用桌面原生重启菜单。'],
+      },
+    },
+    '/dsh-restart/status': { body: STATUS },
+  })
+  buttonByLabel(holder.tree, '确认重启').props.onClick()
+  await flush()
+  // setArmed(null) was applied and no countdown replaced the form.
+  assert.deepEqual(holder.values[4], [null, null])
+  const text = textOf(holder.tree)
+  assert.ok(text.includes('未安排重启：无法确认桌面主进程'), text)
+  assert.ok(!text.includes('已安排重启'), text)
+  // The form is still there, so the dialog did not switch to the countdown.
+  assert.ok(text.includes('确认重启'), text)
+})
+
+test('an armed:false answer whose detail lives in notes still shows that detail', async () => {
+  const holder = {}
+  const react = fakeReact({ 0: STATUS, 1: true }, holder)
+  renderWithFetch(react, holder, {
+    '/dsh-restart/arm': {
+      body: {
+        armed: false,
+        // The plan summary is benign here; the refusal is in the notes.
+        summary: '将派发 detached supervisor：等本进程退出后用同一命令行拉起。',
+        notes: ['未安排重启：写入重启记录失败（EACCES）。'],
+      },
+    },
+    '/dsh-restart/status': { body: STATUS },
+  })
+  buttonByLabel(holder.tree, '确认重启').props.onClick()
+  await flush()
+  assert.deepEqual(holder.values[4], [null, null])
+  const text = textOf(holder.tree)
+  assert.ok(text.includes('写入重启记录失败'), text)
+  assert.ok(!text.includes('已安排重启'), text)
+})
+
+test('a cancel answered with cancelled:false keeps the countdown and shows the explanation', async () => {
+  const holder = {}
+  const armed = { fireAt: '2026-09-18 18:00:00', delaySeconds: 10, at: Date.now(), plan: { logPath: '/tmp/x.log' } }
+  const react = fakeReact({ 0: STATUS, 1: true, 4: armed }, holder)
+  renderWithFetch(react, holder, {
+    '/dsh-restart/cancel': {
+      body: { cancelled: false, wasArmed: true, notes: ['重启已经开始；桌面任务退出确认仍可取消退出。'] },
+    },
+    '/dsh-restart/status': { body: { ...STATUS, armed: true } },
+  })
+  buttonByLabel(holder.tree, '取消这次重启').props.onClick()
+  await flush()
+  // The armed state was never cleared.
+  assert.deepEqual(holder.values[4], [armed])
+  const text = textOf(holder.tree)
+  assert.ok(text.includes('重启已经开始'), text)
+  assert.ok(text.includes('已安排重启'), text)
+  assert.ok(text.includes('取消这次重启'), text)
+})
+
+test('a real cancellation clears the countdown', async () => {
+  const holder = {}
+  const armed = { fireAt: '2026-09-18 18:00:00', delaySeconds: 10, at: Date.now(), plan: { logPath: '/tmp/x.log' } }
+  const react = fakeReact({ 0: STATUS, 1: true, 4: armed }, holder)
+  renderWithFetch(react, holder, {
+    '/dsh-restart/cancel': { body: { cancelled: true, wasArmed: true, notes: ['已取消。'] } },
+    '/dsh-restart/status': { body: STATUS },
+  })
+  buttonByLabel(holder.tree, '取消这次重启').props.onClick()
+  await flush()
+  assert.deepEqual(holder.values[4], [armed, null])
+  assert.ok(!textOf(holder.tree).includes('已安排重启'))
 })
 
 test('the browser half duplicates exactly the host route paths', () => {

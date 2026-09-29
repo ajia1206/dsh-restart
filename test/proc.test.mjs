@@ -5,8 +5,9 @@ import { createServer } from 'node:http'
 import test from 'node:test'
 
 import {
-  findListeningPort, findSupervisorJob, formatCommand, parseLaunchctlList,
-  parsePort, probeHealth, processAlive, readAncestors, readProcess,
+  findListeningPort, findSupervisorJob, formatCommand, parseKeepAlive,
+  parseLaunchctlList, parsePort, probeHealth, processAlive, readAncestors,
+  readJobKeepAlive, readProcess,
 } from '../lib/proc.js'
 
 const TAB = String.fromCharCode(9)
@@ -17,25 +18,163 @@ const LIST = [
   '12006' + TAB + '-2' + TAB + 'local.dsh.tunnel',
 ].join('\n')
 
-test('parseLaunchctlList reads pids, statuses and labels', () => {
-  const jobs = parseLaunchctlList(LIST)
-  assert.equal(jobs.length, 3)
-  assert.deepEqual(jobs[0], { pid: 11997, status: 0, label: 'com.dsh.web-alpha2' })
-  assert.deepEqual(jobs[1], { pid: null, status: 0, label: 'com.apple.unloaded' })
-  assert.deepEqual(jobs[2], { pid: 12006, status: -2, label: 'local.dsh.tunnel' })
-  assert.deepEqual(parseLaunchctlList(''), [])
-})
+// Real shape of a RunningBoard-submitted desktop app job: there is no
+// properties block at all, and nothing here describes a KeepAlive policy.
+const RUNNINGBOARD = [
+  'gui/501/application.com.deepseek.dsh.519595170.519595176 = {',
+  TAB + 'active count = 6',
+  TAB + 'state = running',
+  TAB + 'program = /Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness',
+  TAB + 'inherited environment = {',
+  TAB + TAB + 'NO_PROXY => localhost,127.0.0.1,::1',
+  TAB + TAB + 'PATH => /usr/bin:/bin:/usr/sbin:/sbin',
+  TAB + '}',
+  TAB + 'pid = 21646',
+  TAB + '}',
+].join('\n')
 
-test('findSupervisorJob matches this process or its direct parent only', () => {
+// LaunchAgent shape: the policy lives inside the properties block, rendered
+// with lower-case, space-stripped keys.
+const AGENT_KEEPALIVE_ON = [
+  'gui/501/com.dsh.web-alpha2 = {',
+  TAB + 'active count = 1',
+  TAB + 'state = running',
+  TAB + 'program = /opt/homebrew/bin/node',
+  TAB + 'arguments = {',
+  TAB + TAB + '/opt/homebrew/bin/node',
+  TAB + TAB + 'dsh',
+  TAB + TAB + 'web',
+  TAB + '}',
+  TAB + 'inherited environment = {',
+  TAB + TAB + 'DSH_KEEPALIVE_HINT => keepalive',
+  TAB + '}',
+  TAB + 'properties = {',
+  TAB + TAB + 'keepalive = 1',
+  TAB + TAB + 'runatload = 1',
+  TAB + '}',
+  TAB + 'pid = 11997',
+  TAB + '}',
+].join('\n')
+
+test('findSupervisorJob prefers the job whose main process is this process', () => {
   const jobs = parseLaunchctlList(LIST)
-  // pid 11997 is the job's main process and the direct parent: launchd owns us
-  // because our exit propagates to it.
-  assert.equal(findSupervisorJob(12006, 11997, jobs).label, 'com.dsh.web-alpha2')
+  // Ambiguous on purpose: this process (12006) is itself the main process of
+  // local.dsh.tunnel AND the direct child of com.dsh.web-alpha2 (11997). The
+  // self-match wins — only that job is restarted by launchd when we exit, so
+  // reporting the parent job instead would let the plan trust a relaunch that
+  // may never come.
+  assert.equal(findSupervisorJob(12006, 11997, jobs).label, 'local.dsh.tunnel')
+  // With no self-match, the parent job is still reported.
+  assert.equal(findSupervisorJob(99999, 11997, jobs).label, 'com.dsh.web-alpha2')
   // We are the job's main process itself.
   assert.equal(findSupervisorJob(11997, 1, jobs).label, 'com.dsh.web-alpha2')
   // A distant descendant must NOT be treated as owned: nothing would restart it.
   assert.equal(findSupervisorJob(63577, 63576, jobs), null)
   assert.equal(findSupervisorJob(999, 998, jobs), null)
+})
+
+test('parseKeepAlive finds no properties block in a RunningBoard app job', () => {
+  assert.equal(parseKeepAlive(RUNNINGBOARD), null)
+  assert.equal(parseKeepAlive(''), null)
+  assert.equal(parseKeepAlive('gui/501/com.dsh.x = {\n' + TAB + 'pid = 1\n}'), null)
+})
+
+test('parseKeepAlive reads the properties block of a LaunchAgent job', () => {
+  assert.equal(parseKeepAlive(AGENT_KEEPALIVE_ON), true)
+})
+
+test('parseKeepAlive understands every boolean rendering', () => {
+  const withValue = value => [
+    'gui/501/com.dsh.x = {',
+    TAB + 'properties = {',
+    TAB + TAB + 'keepalive = ' + value,
+    TAB + '}',
+    '}',
+  ].join('\n')
+  assert.equal(parseKeepAlive(withValue('1')), true)
+  assert.equal(parseKeepAlive(withValue('true')), true)
+  assert.equal(parseKeepAlive(withValue('TRUE')), true)
+  assert.equal(parseKeepAlive(withValue('Yes')), true)
+  assert.equal(parseKeepAlive(withValue('0')), false)
+  assert.equal(parseKeepAlive(withValue('false')), false)
+  assert.equal(parseKeepAlive(withValue('No')), false)
+  // A nested dict is still a configured KeepAlive policy.
+  assert.equal(parseKeepAlive([
+    'gui/501/com.dsh.x = {',
+    TAB + 'properties = {',
+    TAB + TAB + 'keepalive = {',
+    TAB + TAB + TAB + 'pathstate = {',
+    TAB + TAB + TAB + TAB + '/tmp/watch => true',
+    TAB + TAB + TAB + '}',
+    TAB + TAB + '}',
+    TAB + '}',
+    '}',
+  ].join('\n')), true)
+  // An empty value asserts nothing.
+  assert.equal(parseKeepAlive(withValue('')), null)
+})
+
+test('parseKeepAlive never mistakes a label, environment or endpoint for a policy', () => {
+  const lines = [
+    'gui/501/com.dsh.keepalive-proxy = {',
+    TAB + 'active count = 1',
+    TAB + 'inherited environment = {',
+    TAB + TAB + 'DSH_ENDPOINT => http://127.0.0.1:28000/keepalive',
+    TAB + TAB + 'KEEPALIVE = true',
+    TAB + '}',
+    TAB + 'dynamic endpoints = {',
+    TAB + TAB + '0x7f00 => com.dsh.keepalive.service',
+    TAB + '}',
+    TAB + 'properties = {',
+    TAB + TAB + 'runatload = 1',
+    TAB + '}',
+    TAB + 'pid = 21646',
+    '}',
+  ].join('\n')
+  // The properties block exists but says nothing about KeepAlive: never true.
+  assert.equal(parseKeepAlive(lines), null)
+  // Without a properties block the same text is still never true.
+  assert.notEqual(parseKeepAlive(lines.replace(TAB + 'properties = {\n', '').replace(TAB + 'runatload = 1\n', '').replace(TAB + '}\n', '')), true)
+  assert.equal(parseKeepAlive('gui/501/keepalive = {\n' + TAB + 'pid = 1\n}'), null)
+})
+
+test('parseKeepAlive stays inside the properties block when it nests braces', () => {
+  const nested = [
+    'gui/501/com.dsh.x = {',
+    TAB + 'properties = {',
+    TAB + TAB + 'keepalive = 1',
+    TAB + TAB + 'environment = {',
+    TAB + TAB + TAB + 'keepalive = 0',
+    TAB + TAB + '}',
+    TAB + '}',
+    TAB + '}',
+  ].join('\n')
+  assert.equal(parseKeepAlive(nested), true)
+  // keepalive only appears after the properties block closed: not our business.
+  const afterBlock = [
+    'gui/501/com.dsh.x = {',
+    TAB + 'properties = {',
+    TAB + TAB + 'runatload = 1',
+    TAB + '}',
+    TAB + 'environment = {',
+    TAB + TAB + 'HINT => keepalive = 1',
+    TAB + '}',
+    '}',
+  ].join('\n')
+  assert.equal(parseKeepAlive(afterBlock), null)
+})
+
+test('readJobKeepAlive returns null when the job cannot be inspected', () => {
+  assert.equal(readJobKeepAlive('com.dsh.gone', 501, () => ''), null)
+  assert.equal(readJobKeepAlive('com.dsh.gone', 501, () => '   \n'), null)
+  assert.equal(readJobKeepAlive('com.dsh.app', 501, () => RUNNINGBOARD), null)
+  assert.equal(readJobKeepAlive('com.dsh.web-alpha2', 501, () => AGENT_KEEPALIVE_ON), true)
+  const seen = []
+  readJobKeepAlive('com.dsh.web-alpha2', 501, (command, args) => {
+    seen.push([command, ...args].join(' '))
+    return ''
+  })
+  assert.deepEqual(seen, ['launchctl print gui/501/com.dsh.web-alpha2'])
 })
 
 test('parsePort understands both --port forms and stops at the first hit', () => {
