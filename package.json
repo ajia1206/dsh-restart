@@ -1,7 +1,7 @@
 {
-  "name": "dsh-restart",
-  "version": "0.1.0",
-  "private": true,
+  "name": "@ajia1206/dsh-restart",
+  "version": "0.1.5",
+  "private": false,
   "description": "One-call restart for the running DSH process, with launchd-aware supervision detection, a verifiable restart log, and a bottom-right GUI control.",
   "type": "module",
   "main": "index.js",
@@ -39,5 +39,16 @@
     "client": {
       "platform": "web"
     }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ajia1206/dsh-restart.git"
+  },
+  "homepage": "https://github.com/ajia1206/dsh-restart",
+  "bugs": {
+    "url": "https://github.com/ajia1206/dsh-restart/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

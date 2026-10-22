@@ -224,8 +224,8 @@ test('readProcess returns null for a missing process', () => {
 
 test('findListeningPort picks the lowest listening port', () => {
   const output = [
-    'node 12006 user 17u IPv4 0x1 0t0 TCP 127.0.0.1:28000 (LISTEN)',
-    'node 12006 user 18u IPv4 0x2 0t0 TCP 127.0.0.1:9000 (LISTEN)',
+    'node 12006 getui 17u IPv4 0x1 0t0 TCP 127.0.0.1:28000 (LISTEN)',
+    'node 12006 getui 18u IPv4 0x2 0t0 TCP 127.0.0.1:9000 (LISTEN)',
   ].join('\n')
   assert.equal(findListeningPort(12006, () => output), 9000)
   assert.equal(findListeningPort(12006, () => ''), null)
